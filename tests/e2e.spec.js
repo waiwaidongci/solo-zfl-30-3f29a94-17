@@ -419,6 +419,215 @@ test('审计记录操作者、时间、动作、对象、结果', async ({ brows
   await context.close();
 });
 
+/* ----------- 8b. 回归: 详情进入即写查看审计(含深链/未登录拒绝) ----------- */
+
+test('打开遗址详情(点击与深链)都写查看审计; 未登录直接打开记拒绝', async ({ browser, page }) => {
+  // 未登录直接请求详情: 401 且管理员能看到一条 actor 为匿名的拒绝记录
+  const anon = await page.request.fetch(BASE + '/api/sites/s-001');
+  expect(anon.status()).toBe(401);
+
+  const { context } = await newLoggedInContext(browser, 'lin', 'lin123');
+
+  // 1) 深链直接进详情
+  const p1 = await context.newPage();
+  await p1.goto('/#site=s-001');
+  await expect(p1.locator('#siteForm')).toBeVisible();
+  await expect(p1.locator('input[name=code]')).toHaveValue('S-001');
+  await p1.close();
+
+  // 2) 普通点击进入
+  const p2 = await context.newPage();
+  await p2.goto('/');
+  await p2.click('#siteList .item:has-text("S-001")');
+  await expect(p2.locator('#siteForm')).toBeVisible();
+  await p2.close();
+
+  // 管理员审计: lin 应有两条"进入详情"成功记录, 另有一条匿名拒绝
+  const admin = await browser.newContext();
+  const ap = await admin.newPage();
+  await loginViaUi(ap, 'admin', 'admin123');
+  await ap.click('button[data-tab=audit]');
+  await ap.selectOption('#auditAction', 'view');
+  await ap.click('#auditBtn');
+  const rows = ap.locator('#auditTable tbody tr');
+  await expect(rows.filter({ hasText: '进入详情' })).toHaveCount(2);
+  const deniedRow = rows.filter({ hasText: '未登录打开遗址详情' });
+  await expect(deniedRow).toHaveCount(1);
+  await expect(deniedRow).toContainText('匿名');
+  await expect(deniedRow).toContainText('拒绝');
+  // 详情记录必须带操作者、时间、对象
+  const firstDetail = rows.filter({ hasText: '进入详情' }).first();
+  await expect(firstDetail).toContainText('lin');
+  await expect(firstDetail).toContainText('S-001');
+  await expect(firstDetail.locator('td').first()).not.toBeEmpty();
+  await admin.close();
+  await context.close();
+});
+
+/* ---------------- 8c. 回归: 隐藏按真实权限记录成功/拒绝 ---------------- */
+
+test('有权隐藏记成功并收起明文; 无权隐藏 403 记拒绝且服务端数据不变', async ({ browser }) => {
+  const { context, page } = await newLoggedInContext(browser, 'lin', 'lin123');
+
+  // lin 对 S-001 备注有权: 揭示 -> 隐藏, 审计为成功
+  await page.click('#siteList .item:has-text("S-001")');
+  await page.click('#noteLocked button');
+  await expect(page.locator('#noteOpen textarea')).toHaveValue(/靠近船肋/);
+  await page.click('[data-hide="note"]');
+  await expect(page.locator('#noteOpen')).toBeHidden();
+  await expect(page.locator('body')).not.toContainText('靠近船肋');
+
+  // 无效字段名: 400 拒绝
+  const badField = await context.request.fetch(BASE + '/api/sites/s-001/hide', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    data: JSON.stringify({ fields: ['depth'] }),
+  });
+  expect(badField.status()).toBe(400);
+
+  // lin 对 S-002 所有受限字段无权: 隐藏记拒绝(而不是成功)
+  for (const f of ['coords', 'image', 'note']) {
+    const r = await context.request.fetch(BASE + '/api/sites/s-002/hide', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      data: JSON.stringify({ fields: [f] }),
+    });
+    expect(r.status(), f).toBe(403);
+    expect(await r.json()).toMatchObject({ denied: [f] });
+  }
+  // 空数组(隐藏全部)同样拒绝, 不能记成功
+  const hideAll = await context.request.fetch(BASE + '/api/sites/s-002/hide', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, data: JSON.stringify({ fields: [] }),
+  });
+  expect(hideAll.status()).toBe(403);
+
+  // 审计核对: 成功隐藏 1 条, 无权隐藏拒绝若干, 操作者/对象/结果齐全
+  const admin = await browser.newContext();
+  const ap = await admin.newPage();
+  await loginViaUi(ap, 'admin', 'admin123');
+  await ap.click('button[data-tab=audit]');
+  await ap.selectOption('#auditAction', 'hide');
+  await ap.click('#auditBtn');
+  const rows = ap.locator('#auditTable tbody tr');
+  await expect(rows.filter({ hasText: '成功' }).filter({ hasText: '隐藏字段: note' })).toHaveCount(1);
+  const denied = rows.filter({ hasText: '拒绝' });
+  expect(await denied.count()).toBeGreaterThanOrEqual(4);
+  await expect(denied.first()).toContainText('lin');
+  await expect(denied.first()).toContainText('S-002');
+  await admin.close();
+  await context.close();
+});
+
+/* ----------- 8d. 回归: 撤权后"下一次会话校验"立即清屏清内存 ------------ */
+
+async function triggerSessionCheck(page) {
+  // 切回窗口的 focus 事件会立即触发一次会话校验(不必干等定时器)
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+}
+
+test('撤销授权后下一次会话校验: 当前页明文收起、DOM清空、再次揭示被拒', async ({ browser }) => {
+  const adminCtx = await browser.newContext();
+  const ap = await adminCtx.newPage();
+  await loginViaUi(ap, 'admin', 'admin123');
+  await ap.click('button[data-tab=grants]');
+  await ap.waitForSelector('#grantsTable tbody tr');
+
+  const linCtx = await browser.newContext();
+  const lp = await linCtx.newPage();
+  await loginViaUi(lp, 'lin', 'lin123');
+  await lp.click('#siteList .item:has-text("S-001")');
+  await lp.click('#noteLocked button');
+  await expect(lp.locator('#noteOpen textarea')).toHaveValue(/靠近船肋/);
+  // 坐标也在当前页可见(真实值)
+  await expect(lp.locator('input[name=x]')).toHaveValue('42');
+
+  // 管理员撤销 g-1(含坐标/影像/备注)
+  const row = ap.locator('#grantsTable tbody tr', { hasText: 'lin' }).filter({ hasText: 'S-001' });
+  await row.locator('button[data-revoke]').click();
+  await expect(row).toContainText('已撤销');
+
+  // lin 旧页面"下一次会话校验"立即清屏(focus 触发, 无需刷新或重登)
+  await triggerSessionCheck(lp);
+  await expect(lp.locator('#noteOpen')).toBeHidden({ timeout: 8000 });
+  await expect(lp.locator('#coordsOpen')).toBeHidden();
+  await expect(lp.locator('body')).not.toContainText('靠近船肋');
+  await expect(lp.locator('input[name=x]')).toHaveValue('');
+  await expect(lp.locator('textarea[name=note]')).toHaveValue('');
+  // 地图上该点变为伪装占位(斜纹)
+  await expect(lp.locator('.marker.obscured').first()).toBeVisible();
+
+  // 明文内存已清: 再点"申请显示"被服务端 403 拒绝
+  await lp.click('#noteLocked button');
+  await expect(lp.locator('#toast.error')).toContainText('越权被拒绝');
+  await expect(lp.locator('body')).not.toContainText('靠近船肋');
+
+  await adminCtx.close(); await linCtx.close();
+});
+
+test('到期后下一次会话校验即时清屏; 账号停用后旧会话 401 回登录并清空', async ({ browser }) => {
+  const adminCtx = await browser.newContext();
+  const ap = await adminCtx.newPage();
+  await loginViaUi(ap, 'admin', 'admin123');
+  await ap.click('button[data-tab=grants]');
+
+  const wangCtx = await browser.newContext();
+  const wp = await wangCtx.newPage();
+  await loginViaUi(wp, 'wang', 'wang123');
+  await wp.click('#siteList .item:has-text("S-002")');
+  await expect(wp.locator('input[name=x]')).toHaveValue('58'); // 有真实坐标授权
+
+  // 授予 5 秒过期的坐标授权? —— wang 本就有 g-2(坐标长期)。改为授权备注并快速过期
+  await ap.selectOption('#grantUser', 'u-wang');
+  await ap.selectOption('#grantSite', 's-001');
+  await ap.check('#fld-note');
+  await ap.click('#grantQuickExpire');
+  await wp.goto('/');
+  await wp.click('#siteList .item:has-text("S-001")');
+  await wp.click('#noteLocked button');
+  await expect(wp.locator('#noteOpen textarea')).toHaveValue(/靠近船肋/);
+  await wp.waitForTimeout(5300);
+  await triggerSessionCheck(wp);
+  await expect(wp.locator('#noteOpen')).toBeHidden({ timeout: 8000 });
+  await expect(wp.locator('body')).not.toContainText('靠近船肋');
+
+  // 停用 wang: 下一次会话校验 401, 旧页面回到登录页
+  await ap.click('button[data-tab=users]');
+  const wangRow = ap.locator('#usersTable tbody tr', { hasText: 'wang' });
+  await wangRow.locator('button[data-active="0"]').click();
+  await triggerSessionCheck(wp);
+  await expect(wp.locator('#loginView')).toBeVisible({ timeout: 8000 });
+  await expect(wp.locator('#appView')).toBeHidden();
+  // 受限输入已清空
+  await expect(wp.locator('textarea[name=note]')).toHaveValue('');
+
+  await adminCtx.close(); await wangCtx.close();
+});
+
+/* ---------------- 8e. 回归: 失败的查看/隐藏不改服务端数据 ---------------- */
+
+test('越权揭示与无权隐藏均失败, 原值与版本保持不变', async ({ browser }) => {
+  const { context } = await newLoggedInContext(browser, 'lin', 'lin123');
+
+  const snapshot = async () => {
+    const r = await context.request.fetch(BASE + '/api/sites/list', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, data: JSON.stringify({ code: 'S-002' }),
+    });
+    const j = await r.json();
+    return j.sites[0];
+  };
+  const before = await snapshot();
+  expect(before.version).toBe(1);
+
+  await context.request.fetch(BASE + '/api/sites/s-002/reveal', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, data: JSON.stringify({ field: 'note' }),
+  });
+  await context.request.fetch(BASE + '/api/sites/s-002/hide', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, data: JSON.stringify({ fields: ['note'] }),
+  });
+  const after = await snapshot();
+  expect(after.version).toBe(before.version);
+  expect(after.updatedAt).toBe(before.updatedAt);
+  expect(after.coords).toMatchObject({ obscured: true });
+});
+
 /* ---------------- 9. 手机端: 授权/查看/导出/撤销/查错全流程 ----------- */
 
 test('手机视口下可完成授权、查看、导出、撤销、查错', async ({ browser }) => {

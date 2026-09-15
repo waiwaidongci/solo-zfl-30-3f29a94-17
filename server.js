@@ -337,12 +337,16 @@ handlers['POST /api/sites/list'] = async (req, res) => {
   const { user } = getUser(req);
   if (!user) return sendJson(res, 401, { error: '未登录' });
   let body = {};
-  try { body = await readBody(req); } catch (_) { body = {}; }
+  try { body = await readBody(req); } catch (_) { body = {} }
+  const silent = body.silent === true; // 前端定时会话校验不算一次显式查看, 不刷审计
+  delete body.silent;
   try {
     const rows = filterSites(body, user);
     // 列表即查看: 记录操作者/时间/结果, 便于查错
-    audit({ actorId: user.id, action: 'list', result: 'success',
-      detail: `列表 ${rows.length} 条${Object.keys(body).length ? '（带筛选）' : ''}`, ip: clientIp(req) });
+    if (!silent) {
+      audit({ actorId: user.id, action: 'list', result: 'success',
+        detail: `列表 ${rows.length} 条${Object.keys(body).length ? '（带筛选）' : ''}`, ip: clientIp(req) });
+    }
     return sendJson(res, 200, { sites: rows.map(s => redactSite(s, user)) });
   } catch (e) {
     audit({ actorId: user.id, action: 'list', result: 'denied', detail: e.clientMsg || e.message, ip: clientIp(req) });
@@ -352,16 +356,38 @@ handlers['POST /api/sites/list'] = async (req, res) => {
 
 handlers['GET /api/sites/:id'] = async (req, res, params) => {
   const { user } = getUser(req);
-  if (!user) return sendJson(res, 401, { error: '未登录' });
+  if (!user) {
+    audit({ actorId: null, action: 'view', target: params.id, result: 'denied',
+      detail: '未登录打开遗址详情', ip: clientIp(req) });
+    return sendJson(res, 401, { error: '未登录' });
+  }
   const site = db.sites.find(s => s.id === params.id);
-  if (!site) return sendJson(res, 404, { error: '遗址不存在' });
+  if (!site) {
+    audit({ actorId: user.id, action: 'view', target: params.id, result: 'denied',
+      detail: '打开不存在的遗址详情', ip: clientIp(req) });
+    return sendJson(res, 404, { error: '遗址不存在' });
+  }
+  const silent = new URL(req.url, 'http://x').searchParams.get('silent') === '1';
+  // 详情进入即一次查看: 记录操作者/时间/对象/结果, 与揭示动作保持同一审计口径
+  if (!silent) {
+    const allowed = fieldsFor(user.id, site.id);
+    const grantDesc = user.role === 'admin'
+      ? '管理员全部字段'
+      : `当前可见受限字段: ${[...allowed].join(',') || '无'}`;
+    audit({ actorId: user.id, action: 'view', target: site.code, result: 'success',
+      detail: `进入详情（${grantDesc}）`, ip: clientIp(req) });
+  }
   return sendJson(res, 200, { site: redactSite(site, user) });
 };
 
 // 受限字段"点开看一眼"也记审计; 只返回当前有权的字段, 服务端重新判定
 handlers['POST /api/sites/:id/reveal'] = async (req, res, params) => {
   const { user } = getUser(req);
-  if (!user) return sendJson(res, 401, { error: '未登录' });
+  if (!user) {
+    audit({ actorId: null, action: 'view', target: params.id, result: 'denied',
+      detail: '未登录请求揭示字段', ip: clientIp(req) });
+    return sendJson(res, 401, { error: '未登录' });
+  }
   const site = db.sites.find(s => s.id === params.id);
   if (!site) return sendJson(res, 404, { error: '遗址不存在' });
   const body = await readBody(req).catch(() => ({}));
@@ -379,15 +405,38 @@ handlers['POST /api/sites/:id/reveal'] = async (req, res, params) => {
   return sendJson(res, 200, { fields: out });
 };
 
+// "隐藏"是用户对已授权字段的查看动作: 必须按真实权限判定, 无权隐藏记拒绝, 不允许记成成功
 handlers['POST /api/sites/:id/hide'] = async (req, res, params) => {
   const { user } = getUser(req);
-  if (!user) return sendJson(res, 401, { error: '未登录' });
+  if (!user) {
+    audit({ actorId: null, action: 'hide', target: params.id, result: 'denied',
+      detail: '未登录请求隐藏', ip: clientIp(req) });
+    return sendJson(res, 401, { error: '未登录' });
+  }
   const site = db.sites.find(s => s.id === params.id);
-  if (!site) return sendJson(res, 404, { error: '遗址不存在' });
+  if (!site) {
+    audit({ actorId: user.id, action: 'hide', target: params.id, result: 'denied', detail: '遗址不存在', ip: clientIp(req) });
+    return sendJson(res, 404, { error: '遗址不存在' });
+  }
   const body = await readBody(req).catch(() => ({}));
-  const fields = (Array.isArray(body.fields) ? body.fields : []).filter(f => RESTRICTED_FIELDS.includes(f));
+  const rawFields = Array.isArray(body.fields) ? body.fields : [];
+  // 非受限/未知字段: 无效操作
+  const unknown = rawFields.filter(f => !RESTRICTED_FIELDS.includes(f));
+  if (unknown.length) {
+    audit({ actorId: user.id, action: 'hide', target: site.code, result: 'denied',
+      detail: `无效隐藏字段: ${unknown.join(',')}`, ip: clientIp(req) });
+    return sendJson(res, 400, { error: `无效字段: ${unknown.join(',')}` });
+  }
+  // 缺省(空数组)视为隐藏全部受限字段, 但只能隐藏本人有权的部分
+  const fields = rawFields.length ? rawFields : RESTRICTED_FIELDS;
+  const noGrant = fields.filter(f => !canField(user, site.id, f));
+  if (noGrant.length) {
+    audit({ actorId: user.id, action: 'hide', target: site.code, result: 'denied',
+      detail: `无权隐藏(未授权)字段: ${noGrant.join(',')}`, ip: clientIp(req) });
+    return sendJson(res, 403, { error: `无权隐藏未授权字段: ${noGrant.join(',')}`, denied: noGrant });
+  }
   audit({ actorId: user.id, action: 'hide', target: site.code, result: 'success',
-    detail: `隐藏字段: ${fields.join(',') || '全部'}`, ip: clientIp(req) });
+    detail: `隐藏字段: ${fields.join(',')}`, ip: clientIp(req) });
   return sendJson(res, 200, { ok: true });
 };
 

@@ -55,15 +55,40 @@ async function api(method, url, body) {
 
 /* ------------------------------- 登录态 --------------------------------- */
 
+// 清空本机所有受限明文: 登出、会话失效、会话校验发现降级时调用
+function purgeSecrets(siteIds) {
+  const ids = siteIds || Object.keys(state.secrets).concat(Object.keys(state.revealedFields), Object.keys(state.imageDrafts));
+  for (const id of new Set(ids)) {
+    delete state.secrets[id];
+    delete state.revealedFields[id];
+    delete state.imageDrafts[id];
+  }
+}
+// 清掉详情表单中残留的受限字段 DOM 值(隐藏并不能防止明文留在页面里)
+function wipeSecretInputs() {
+  const f = $('#siteForm');
+  if (f) { f.note.value = ''; f.x.value = ''; f.y.value = ''; }
+  const img = $('#imagePreview');
+  if (img) img.removeAttribute('src');
+}
+
 async function boot() {
   try {
     const { user } = await api('GET', '/api/me');
     enterApp(user);
+    // 支持深链直接进入某条遗址详情: /#site=s-001 也会触发服务端详情查看审计
+    const m = location.hash.match(/site=([\w-]+)/);
+    if (m) await selectSite(m[1], { fromHash: true });
   } catch (_) {
     showLogin();
   }
 }
 function showLogin() {
+  // 会话失效: 内存中的明文与未保存影像草稿一并清掉, 不留在旧页面
+  purgeSecrets();
+  wipeSecretInputs();
+  state.sites = [];
+  state.selectedId = null;
   $('#loginView').classList.remove('hidden');
   $('#appView').classList.add('hidden');
   stopPolling();
@@ -76,7 +101,7 @@ function enterApp(user) {
   $$('#tabs [data-admin]').forEach(b => b.classList.toggle('hidden', user.role !== 'admin'));
   $('#deleteBtn').classList.toggle('hidden', user.role !== 'admin');
   switchTab('sites');
-  startPolling();
+  startSessionChecks();
 }
 $('#loginForm').addEventListener('submit', async e => {
   e.preventDefault();
@@ -92,7 +117,7 @@ $('#loginForm').addEventListener('submit', async e => {
 });
 $('#logoutBtn').addEventListener('click', async () => {
   try { await api('POST', '/api/auth/logout'); } catch (_) {}
-  state.me = null; state.sites = []; state.selectedId = null;
+  state.me = null;
   showLogin();
 });
 
@@ -120,19 +145,53 @@ function initStaticOptions() {
   }
 }
 
-async function loadSites() {
-  const body = {};
+async function loadSites(opts = {}) {
+  const body = { silent: !!opts.silent };
   if (state.filters.type) body.type = state.filters.type;
   if (state.filters.dive) body.dive = state.filters.dive;
   if (state.filters.code) body.code = state.filters.code;
   try {
     const { sites } = await api('POST', '/api/sites/list', body);
+    reconcilePermissions(sites);
     state.sites = sites;
     renderSites();
   } catch (err) {
     if (err.status === 401) return showLogin();
     toast(err.message, 'error');
   }
+}
+
+/**
+ * 会话校验核心: 拿最新权限与本机已揭示内容对照。
+ * 一旦发现字段被收回(撤销/到期/停用), 立即:
+ *  1) 删除该字段内存明文、揭示态、影像草稿; 2) 清空详情表单/DOM 残留;
+ * 保证服务端拒绝后的"下一次会话校验"不会把无权明文留在当前页面。
+ */
+function reconcilePermissions(freshSites) {
+  const prev = state._permSnapshot || {};
+  let reducedAny = false;
+  for (const fresh of freshSites) {
+    const old = prev[fresh.id];
+    if (!old) continue;
+    const lost = RESTRICTED.filter(f => old[f] && !fresh.permissions[f]);
+    if (!lost.length) continue;
+    reducedAny = true;
+    const rev = state.revealedFields[fresh.id];
+    const sec = state.secrets[fresh.id];
+    for (const f of lost) {
+      if (rev) rev.delete(f);
+      if (sec) delete sec[f];
+      delete state.imageDrafts[fresh.id];
+    }
+    if (state.selectedId === fresh.id) {
+      const f = $('#siteForm');
+      if (lost.includes('note')) f.note.value = '';
+      if (lost.includes('coords')) { f.x.value = ''; f.y.value = ''; }
+      if (lost.includes('image')) { $('#imagePreview').removeAttribute('src'); $('#imageFile').value = ''; }
+    }
+  }
+  state._permSnapshot = Object.fromEntries(freshSites.map(s => [s.id, { ...s.permissions }]));
+  return reducedAny;
 }
 
 function currentSite() { return state.sites.find(s => s.id === state.selectedId) || null; }
@@ -178,18 +237,6 @@ function renderSites() {
     </div>`;
   }).join('');
   $$('#siteList [data-id]').forEach(el => el.addEventListener('click', () => selectSite(el.dataset.id)));
-
-  // 选中站点仍在列表中: 仅在"权限被收回/过期"时重绘详情, 避免轮询打断正在进行的编辑
-  // (版本落后不在此处覆盖表单 —— 提交时由乐观锁兜底并展示冲突)
-  if (state.selectedId) {
-    const fresh = state.sites.find(s => s.id === state.selectedId);
-    const oldPerms = (state._lastPerms || {})[state.selectedId];
-    if (fresh && oldPerms && RESTRICTED.some(f => oldPerms[f] && !fresh.permissions[f])) {
-      renderDetail(fresh);
-      toast('授权状态已变化，无权字段已即时隐藏', 'warn');
-    }
-    state._lastPerms = Object.fromEntries(state.sites.map(s => [s.id, { ...s.permissions }]));
-  }
 }
 
 $('#searchBtn').addEventListener('click', () => {
@@ -239,17 +286,34 @@ $('#map').addEventListener('click', ev => {
   $('#siteForm').x.value = x; $('#siteForm').y.value = y;
 });
 
-function selectSite(id) {
-  const site = currentSite();
-  const target = state.sites.find(s => s.id === id);
-  if (!target) return;
+// 进入详情: 以服务端 GET 详情为准(并由服务端写"查看"审计), 不直接复用列表数据
+async function selectSite(id, opts = {}) {
+  if (!opts.fromHash) history.replaceState(null, '', `#site=${id}`);
   state.selectedId = id;
   $('#detailEmpty').classList.add('hidden');
   $('#siteForm').classList.remove('hidden');
   $('#conflictBox').classList.add('hidden');
-  renderDetail(target);
-  renderSites();
+  try {
+    const { site } = await api('GET', `/api/sites/${encodeURIComponent(id)}`);
+    // 用详情响应同步列表缓存里的权限/版本, 并收敛一次本机明文
+    const reduced = reconcilePermissions([site]);
+    const idx = state.sites.findIndex(s => s.id === site.id);
+    if (idx > -1) state.sites[idx] = site;
+    renderDetail(site);
+    renderSites();
+    if (reduced) toast('授权状态已变化，无权字段已立即清除并隐藏', 'warn');
+  } catch (err) {
+    if (err.status === 401) return showLogin();
+    if (err.status === 404) { clearDetail(); return toast('遗址不存在或已被删除', 'error'); }
+    toast(err.message, 'error');
+  }
 }
+
+window.addEventListener('hashchange', () => {
+  if (!state.me) return;
+  const m = location.hash.match(/site=([\w-]+)/);
+  if (m && m[1] !== state.selectedId) selectSite(m[1], { fromHash: true });
+});
 
 function setupFieldUi(site, perms, isNew) {
   for (const f of RESTRICTED) {
@@ -319,27 +383,39 @@ function renderDetail(site) {
   form.orientation.value = site.orientation || '';
   form.condition.value = site.condition || '';
   $('#versionInfo').textContent = `当前版本 v${site.version} · 更新于 ${new Date(site.updatedAt).toLocaleString()}`;
+  applySecretPanel(site);
+}
 
-  setupFieldUi(site, site.permissions, false);
+/**
+ * 只按最新权限刷新"坐标/影像/备注"三个受限区与本机明文,
+ * 不动公共字段输入和版本基线 —— 供定时会话校验调用, 不打断正在进行的编辑。
+ */
+function applySecretPanel(site) {
+  const form = $('#siteForm');
+  const sec = state.secrets[site.id] || {};
+  // 以本次详情的真实权限为准: 对任何已无权字段, 内存明文/揭示态/草稿一律清除
+  for (const f of RESTRICTED) {
+    if (!site.permissions[f]) {
+      const rev = state.revealedFields[site.id];
+      if (rev) rev.delete(f);
+      delete sec[f];
+      delete state.imageDrafts[site.id];
+    }
+  }
 
-  // 坐标: 有权限则列表已下发真实值, 直接可编辑; 无权限时显示的是伪装占位
+  // 坐标: 有权限为真实值且可编辑; 无权限时表单里绝不能残留旧真值
   if (site.permissions.coords && site.coords && !site.coords.obscured) {
-    form.x.value = site.coords.x; form.y.value = site.coords.y;
+    // 正在编辑坐标时不要用轮询值打断键入
+    if (document.activeElement !== form.x) form.x.value = site.coords.x;
+    if (document.activeElement !== form.y) form.y.value = site.coords.y;
     $('#coordsMeta').textContent = `真实坐标 ${site.coords.x}%, ${site.coords.y}%`;
   } else {
     form.x.value = ''; form.y.value = '';
-    $('#coordsMeta').textContent = '无授权时坐标不真实';
+    $('#coordsMeta').textContent = site.hasCoords ? '无授权：地图所示为伪装占位位置' : '该记录暂无坐标';
   }
-  const sec = secretsOf(site.id);
-  // 影像/备注权限被撤销或过期: 立即清掉本机内存明文与未保存草稿
-  for (const f of ['image', 'note']) {
-    if (!site.permissions[f] && revealed(site.id).has(f)) {
-      revealed(site.id).delete(f);
-      delete sec[f];
-    }
-  }
-  if (!site.permissions.image && state.imageDrafts[site.id]) delete state.imageDrafts[site.id];
-  if (revealed(site.id).has('image') && (sec.image || state.imageDrafts[site.id])) {
+
+  // 影像: 只有"仍有权限且本会话已揭示(或有未保存草稿)"才显示
+  if (site.permissions.image && revealed(site.id).has('image') && (sec.image || state.imageDrafts[site.id])) {
     $('#imagePreview').src = state.imageDrafts[site.id] || sec.image;
     $('#imagePreview').classList.remove('hidden');
   } else {
@@ -347,12 +423,12 @@ function renderDetail(site) {
     $('#imagePreview').removeAttribute('src');
   }
   $('#imageFile').value = '';
-  if (revealed(site.id).has('note')) {
-    form.note.value = sec.note || '';
-  } else {
-    // 未揭示/授权被收回时, 文本框中的旧明文必须清掉, 不能只靠隐藏
-    form.note.value = '';
-  }
+
+  // 备注: 未揭示或授权被收回时文本框必须清空, 不能只靠隐藏把明文留在 DOM 里
+  if (!(site.permissions.note && revealed(site.id).has('note'))) form.note.value = '';
+  else if (document.activeElement !== form.note) form.note.value = sec.note || '';
+
+  // 权限/揭示态决定锁框与展开框(依据上面已清理过的状态)
   setupFieldUi(site, site.permissions, false);
 }
 
@@ -361,26 +437,57 @@ document.addEventListener('click', async ev => {
   const rev = ev.target.closest('[data-reveal]');
   const hid = ev.target.closest('[data-hide]');
   if (!rev && !hid) return;
-  const site = currentSite();
-  if (!site) return;
+  const id = $('#siteForm').id.value;
+  if (!id) return;
   const field = (rev && rev.dataset.reveal) || (hid && hid.dataset.hide);
   if (rev) {
     try {
-      const { fields } = await api('POST', `/api/sites/${site.id}/reveal`, { field });
-      Object.assign(secretsOf(site.id), fields);
-      revealed(site.id).add(field);
+      const { fields } = await api('POST', `/api/sites/${id}/reveal`, { field });
+      Object.assign(secretsOf(id), fields);
+      revealed(id).add(field);
       toast(`已显示${FIELD_NAMES[field]}（操作已记录）`, 'ok');
-      renderDetail(currentSite());
+      const fresh = await api('GET', `/api/sites/${id}?silent=1`);
+      const idx = state.sites.findIndex(s => s.id === id);
+      if (idx > -1) state.sites[idx] = fresh.site;
+      renderDetail(fresh.site);
     } catch (err) {
+      if (err.status === 401) return showLogin();
       toast(err.status === 403 ? `越权被拒绝：${err.message}` : err.message, 'error');
-      await loadSites();
+      // 服务端拒绝后立即按最新权限收敛: 清内存并收起字段
+      try {
+        const { site } = await api('GET', `/api/sites/${id}?silent=1`);
+        const reduced = reconcilePermissions([site]);
+        const idx = state.sites.findIndex(s => s.id === id);
+        if (idx > -1) state.sites[idx] = site;
+        renderDetail(site);
+        if (reduced) toast('授权状态已变化，无权明文已清除', 'warn');
+      } catch (_) {}
     }
   } else {
-    try { await api('POST', `/api/sites/${site.id}/hide`, { fields: [field] }); } catch (_) {}
-    revealed(site.id).delete(field);
-    delete secretsOf(site.id)[field];
-    renderDetail(currentSite());
-    toast(`已隐藏${FIELD_NAMES[field]}`, 'ok');
+    try {
+      await api('POST', `/api/sites/${id}/hide`, { fields: [field] });
+      // 隐藏成功(审计已记): 收起并删除本机内存明文
+      revealed(id).delete(field);
+      delete secretsOf(id)[field];
+      if (field === 'image') delete state.imageDrafts[id];
+      const site = currentSite() || (await api('GET', `/api/sites/${id}?silent=1`)).site;
+      renderDetail(site);
+      toast(`已隐藏${FIELD_NAMES[field]}`, 'ok');
+    } catch (err) {
+      if (err.status === 401) return showLogin();
+      // 无权隐藏是无效操作: 服务端已记拒绝; 本地同样不得保留该字段明文
+      toast(`隐藏被拒绝：${err.message}`, 'error');
+      revealed(id).delete(field);
+      delete secretsOf(id)[field];
+      delete state.imageDrafts[id];
+      try {
+        const { site } = await api('GET', `/api/sites/${id}?silent=1`);
+        reconcilePermissions([site]);
+        const idx = state.sites.findIndex(s => s.id === id);
+        if (idx > -1) state.sites[idx] = site;
+        renderDetail(site);
+      } catch (_) {}
+    }
   }
 });
 
@@ -429,9 +536,10 @@ async function saveSite() {
     }
     state.selectedId = saved.id;
     delete state.revealedFields[saved.id]; state.secrets[saved.id] = {};
-    form.version.value = saved.version;
+    delete state.imageDrafts[saved.id];
     $('#conflictBox').classList.add('hidden');
     await loadSites();
+    await selectSite(saved.id);
   } catch (err) {
     if (err.status === 409) {
       showConflict(payload, err.data.current);
@@ -649,15 +757,61 @@ async function loadAudit() {
 }
 $('#auditBtn').addEventListener('click', loadAudit);
 
-/* ---------------- 轮询: 授权停用/过期后, 旧会话立即降权 ------------------- */
+/* ------- 会话校验: 授权撤销/到期/停用后, 旧页面在下一次校验即降权清屏 ------- */
 
-function startPolling() {
-  stopPolling();
-  state.pollTimer = setInterval(() => {
-    if (!$('#tab-sites').classList.contains('hidden')) loadSites();
-  }, 5000);
+let checking = false;
+async function sessionCheck() {
+  if (checking || !state.me) return;
+  checking = true;
+  try {
+    // 1) 会话本身是否仍有效(被停用/登出会 401)
+    const { user } = await api('GET', '/api/me');
+    if (!user.active || user.id !== state.me.id) return showLogin();
+
+    if (!$('#tab-sites').classList.contains('hidden')) {
+      // 2) 已打开详情时优先只校验该条, 撤销/到期会立刻在当前页面清屏
+      if (state.selectedId) {
+        const { site } = await api('GET', `/api/sites/${state.selectedId}?silent=1`);
+        const reduced = reconcilePermissions([site]);
+        const idx = state.sites.findIndex(s => s.id === site.id);
+        if (idx > -1) state.sites[idx] = site;
+        applySecretPanel(site); // 只收敛受限字段区, 公共字段/版本基线不动
+        if (reduced) toast('授权已撤销或过期，无权明文已从当前页面清除', 'warn');
+        // 地图/列表上的其它记录权限也同步, 但不打断详情
+        const body = { silent: true };
+        if (state.filters.type) body.type = state.filters.type;
+        if (state.filters.dive) body.dive = state.filters.dive;
+        if (state.filters.code) body.code = state.filters.code;
+        const list = await api('POST', '/api/sites/list', body);
+        reconcilePermissions(list.sites);
+        state.sites = list.sites.map(s => s.id === site.id ? site : s);
+        renderSites();
+      } else {
+        await loadSites({ silent: true });
+      }
+    }
+  } catch (err) {
+    if (err.status === 401) showLogin();
+    // 其它错误(网络抖动等)保留当前页面, 下次校验再收敛
+  } finally {
+    checking = false;
+  }
 }
-function stopPolling() { if (state.pollTimer) clearInterval(state.pollTimer); state.pollTimer = null; }
+
+function startSessionChecks() {
+  stopPolling();
+  state.pollTimer = setInterval(sessionCheck, 3000);
+  // 切回该标签页/窗口重新聚焦时立即校验一次, 不等定时器
+  document.addEventListener('visibilitychange', onVisibleCheck);
+  window.addEventListener('focus', sessionCheck);
+}
+function onVisibleCheck() { if (document.visibilityState === 'visible') sessionCheck(); }
+function stopPolling() {
+  if (state.pollTimer) clearInterval(state.pollTimer);
+  state.pollTimer = null;
+  document.removeEventListener('visibilitychange', onVisibleCheck);
+  window.removeEventListener('focus', sessionCheck);
+}
 
 initStaticOptions();
 boot();
