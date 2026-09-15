@@ -1,0 +1,17 @@
+{
+  "name": "sensitive-site-sharing",
+  "version": "1.0.0",
+  "description": "离线敏感遗址分级共享台：字段级授权、有效期、乐观锁、审计与导出隔离",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "playwright test",
+    "test:headed": "playwright test --headed"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@playwright/test": "^1.63.0"
+  }
+}
