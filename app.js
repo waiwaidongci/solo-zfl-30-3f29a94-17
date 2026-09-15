@@ -145,53 +145,66 @@ function initStaticOptions() {
   }
 }
 
-async function loadSites(opts = {}) {
-  const body = { silent: !!opts.silent };
+async function loadSites() {
+  const body = {};
   if (state.filters.type) body.type = state.filters.type;
   if (state.filters.dive) body.dive = state.filters.dive;
   if (state.filters.code) body.code = state.filters.code;
   try {
     const { sites } = await api('POST', '/api/sites/list', body);
-    reconcilePermissions(sites);
+    const delta = reconcilePermissions(sites);
     state.sites = sites;
     renderSites();
+    // 手动刷新同样要让当前详情的丢权字段立即收屏
+    if (state.selectedId && delta.lost.some(x => x.id === state.selectedId)) {
+      const fresh = sites.find(s => s.id === state.selectedId);
+      if (fresh) applySecretPanel(fresh);
+      toast('授权状态已变化，无权明文已立即清除并隐藏', 'warn');
+    }
+    return delta;
   } catch (err) {
-    if (err.status === 401) return showLogin();
+    if (err.status === 401) { showLogin(); return { lost: [], gained: [] }; }
     toast(err.message, 'error');
+    return { lost: [], gained: [] };
   }
 }
 
 /**
- * 会话校验核心: 拿最新权限与本机已揭示内容对照。
- * 一旦发现字段被收回(撤销/到期/停用), 立即:
- *  1) 删除该字段内存明文、揭示态、影像草稿; 2) 清空详情表单/DOM 残留;
- * 保证服务端拒绝后的"下一次会话校验"不会把无权明文留在当前页面。
+ * 会话校验核心: 拿最新权限与本机快照对照。
+ * 返回 { lost, gained }:
+ *  - lost(撤销/到期/停用): 立即删除内存明文、揭示态、影像草稿并清空详情 DOM;
+ *  - gained(新授权): 不在这里补发明文, 由调用方走一次有审计的正常读取。
+ * 快照按 id 合并而非整体替换, 防止列表筛选把未出现的站点误判为丢权。
  */
 function reconcilePermissions(freshSites) {
-  const prev = state._permSnapshot || {};
-  let reducedAny = false;
+  const prev = state._permSnapshot || (state._permSnapshot = {});
+  const lost = [];
+  const gained = [];
   for (const fresh of freshSites) {
     const old = prev[fresh.id];
-    if (!old) continue;
-    const lost = RESTRICTED.filter(f => old[f] && !fresh.permissions[f]);
-    if (!lost.length) continue;
-    reducedAny = true;
-    const rev = state.revealedFields[fresh.id];
-    const sec = state.secrets[fresh.id];
-    for (const f of lost) {
-      if (rev) rev.delete(f);
-      if (sec) delete sec[f];
-      delete state.imageDrafts[fresh.id];
+    for (const f of RESTRICTED) {
+      if (old && old[f] && !fresh.permissions[f]) lost.push({ id: fresh.id, field: f });
+      if ((!old || !old[f]) && fresh.permissions[f]) gained.push({ id: fresh.id, field: f });
     }
-    if (state.selectedId === fresh.id) {
-      const f = $('#siteForm');
-      if (lost.includes('note')) f.note.value = '';
-      if (lost.includes('coords')) { f.x.value = ''; f.y.value = ''; }
-      if (lost.includes('image')) { $('#imagePreview').removeAttribute('src'); $('#imageFile').value = ''; }
+    if (old && lost.some(x => x.id === fresh.id)) {
+      const lostFields = lost.filter(x => x.id === fresh.id).map(x => x.field);
+      const rev = state.revealedFields[fresh.id];
+      const sec = state.secrets[fresh.id];
+      for (const f of lostFields) {
+        if (rev) rev.delete(f);
+        if (sec) delete sec[f];
+        delete state.imageDrafts[fresh.id];
+      }
+      if (state.selectedId === fresh.id) {
+        const form = $('#siteForm');
+        if (lostFields.includes('note')) form.note.value = '';
+        if (lostFields.includes('coords')) { form.x.value = ''; form.y.value = ''; }
+        if (lostFields.includes('image')) { $('#imagePreview').removeAttribute('src'); $('#imageFile').value = ''; }
+      }
     }
+    prev[fresh.id] = { ...fresh.permissions };
   }
-  state._permSnapshot = Object.fromEntries(freshSites.map(s => [s.id, { ...s.permissions }]));
-  return reducedAny;
+  return { lost, gained };
 }
 
 function currentSite() { return state.sites.find(s => s.id === state.selectedId) || null; }
@@ -296,12 +309,12 @@ async function selectSite(id, opts = {}) {
   try {
     const { site } = await api('GET', `/api/sites/${encodeURIComponent(id)}`);
     // 用详情响应同步列表缓存里的权限/版本, 并收敛一次本机明文
-    const reduced = reconcilePermissions([site]);
+    const delta = reconcilePermissions([site]);
     const idx = state.sites.findIndex(s => s.id === site.id);
     if (idx > -1) state.sites[idx] = site;
     renderDetail(site);
     renderSites();
-    if (reduced) toast('授权状态已变化，无权字段已立即清除并隐藏', 'warn');
+    if (delta.lost.length) toast('授权状态已变化，无权字段已立即清除并隐藏', 'warn');
   } catch (err) {
     if (err.status === 401) return showLogin();
     if (err.status === 404) { clearDetail(); return toast('遗址不存在或已被删除', 'error'); }
@@ -432,6 +445,20 @@ function applySecretPanel(site) {
   setupFieldUi(site, site.permissions, false);
 }
 
+// 通过内部校验通道只刷新权限位(不触碰业务数据, 不产生查看审计), 回传更新后的本地缓存对象
+async function refreshPermsOnly(id) {
+  const { sites } = await api('POST', '/api/session/check', { siteId: id });
+  const view = sites.find(s => s.id === id);
+  if (!view) return null;
+  const delta = reconcilePermissions([view]);
+  const cached = currentSite() || state.sites.find(s => s.id === id);
+  const merged = cached
+    ? Object.assign(cached, { permissions: view.permissions, version: view.version })
+    : { id, version: view.version, permissions: view.permissions };
+  if (!state.sites.some(s => s.id === id)) state.sites.push(merged);
+  return { site: merged, delta };
+}
+
 // 申请显示 / 隐藏
 document.addEventListener('click', async ev => {
   const rev = ev.target.closest('[data-reveal]');
@@ -446,22 +473,20 @@ document.addEventListener('click', async ev => {
       Object.assign(secretsOf(id), fields);
       revealed(id).add(field);
       toast(`已显示${FIELD_NAMES[field]}（操作已记录）`, 'ok');
-      const fresh = await api('GET', `/api/sites/${id}?silent=1`);
-      const idx = state.sites.findIndex(s => s.id === id);
-      if (idx > -1) state.sites[idx] = fresh.site;
-      renderDetail(fresh.site);
+      // 只经内部校验通道同步权限, 不补拉详情明文
+      const r = await refreshPermsOnly(id);
+      if (r) applySecretPanel(r.site);
     } catch (err) {
       if (err.status === 401) return showLogin();
       toast(err.status === 403 ? `越权被拒绝：${err.message}` : err.message, 'error');
-      // 服务端拒绝后立即按最新权限收敛: 清内存并收起字段
+      // 服务端拒绝后立即经内部校验通道按最新权限收敛: 清内存并收起字段
       try {
-        const { site } = await api('GET', `/api/sites/${id}?silent=1`);
-        const reduced = reconcilePermissions([site]);
-        const idx = state.sites.findIndex(s => s.id === id);
-        if (idx > -1) state.sites[idx] = site;
-        renderDetail(site);
-        if (reduced) toast('授权状态已变化，无权明文已清除', 'warn');
-      } catch (_) {}
+        const r = await refreshPermsOnly(id);
+        if (r) {
+          applySecretPanel(r.site);
+          if (r.delta.lost.length) toast('授权状态已变化，无权明文已清除', 'warn');
+        }
+      } catch (e) { if (e.status === 401) showLogin(); }
     }
   } else {
     try {
@@ -470,8 +495,8 @@ document.addEventListener('click', async ev => {
       revealed(id).delete(field);
       delete secretsOf(id)[field];
       if (field === 'image') delete state.imageDrafts[id];
-      const site = currentSite() || (await api('GET', `/api/sites/${id}?silent=1`)).site;
-      renderDetail(site);
+      const r = await refreshPermsOnly(id);
+      renderDetail(r ? r.site : currentSite());
       toast(`已隐藏${FIELD_NAMES[field]}`, 'ok');
     } catch (err) {
       if (err.status === 401) return showLogin();
@@ -481,12 +506,9 @@ document.addEventListener('click', async ev => {
       delete secretsOf(id)[field];
       delete state.imageDrafts[id];
       try {
-        const { site } = await api('GET', `/api/sites/${id}?silent=1`);
-        reconcilePermissions([site]);
-        const idx = state.sites.findIndex(s => s.id === id);
-        if (idx > -1) state.sites[idx] = site;
-        renderDetail(site);
-      } catch (_) {}
+        const r = await refreshPermsOnly(id);
+        if (r) renderDetail(r.site);
+      } catch (e) { if (e.status === 401) showLogin(); }
     }
   }
 });
@@ -764,31 +786,30 @@ async function sessionCheck() {
   if (checking || !state.me) return;
   checking = true;
   try {
-    // 1) 会话本身是否仍有效(被停用/登出会 401)
-    const { user } = await api('GET', '/api/me');
+    // 内部校验端点: 只回会话状态与各遗址权限位, 不返回任何业务数据(因此不产生查看审计),
+    // 也不能由客户端决定是否审计。
+    const { user, sites: permViews } = await api('POST', '/api/session/check', {});
     if (!user.active || user.id !== state.me.id) return showLogin();
 
+    const delta = reconcilePermissions(permViews);
+    // 把权限位合并回本地缓存(业务数据仍来自此前有审计的读取), 地图/列表/受限区据此重绘
+    for (const v of permViews) {
+      const cached = state.sites.find(s => s.id === v.id);
+      if (cached) { cached.permissions = v.permissions; cached.version = v.version; }
+    }
+
     if (!$('#tab-sites').classList.contains('hidden')) {
-      // 2) 已打开详情时优先只校验该条, 撤销/到期会立刻在当前页面清屏
-      if (state.selectedId) {
-        const { site } = await api('GET', `/api/sites/${state.selectedId}?silent=1`);
-        const reduced = reconcilePermissions([site]);
-        const idx = state.sites.findIndex(s => s.id === site.id);
-        if (idx > -1) state.sites[idx] = site;
-        applySecretPanel(site); // 只收敛受限字段区, 公共字段/版本基线不动
-        if (reduced) toast('授权已撤销或过期，无权明文已从当前页面清除', 'warn');
-        // 地图/列表上的其它记录权限也同步, 但不打断详情
-        const body = { silent: true };
-        if (state.filters.type) body.type = state.filters.type;
-        if (state.filters.dive) body.dive = state.filters.dive;
-        if (state.filters.code) body.code = state.filters.code;
-        const list = await api('POST', '/api/sites/list', body);
-        reconcilePermissions(list.sites);
-        state.sites = list.sites.map(s => s.id === site.id ? site : s);
+      if (delta.lost.length) {
+        if (state.selectedId && delta.lost.some(x => x.id === state.selectedId)) {
+          const cached = state.sites.find(s => s.id === state.selectedId);
+          if (cached) applySecretPanel(cached); // 只收受限区, 不动公共字段/版本基线
+          toast('授权已撤销或过期，无权明文已从当前页面清除', 'warn');
+        }
         renderSites();
-      } else {
-        await loadSites({ silent: true });
       }
+      // 新获得授权时, 走一次正常(有审计)的列表读取以展示真实坐标/权限标记;
+      // 不在这里自动补发明文详情, 由用户点击进入(产生详情查看审计)。
+      if (delta.gained.length) await loadSites();
     }
   } catch (err) {
     if (err.status === 401) showLogin();

@@ -306,6 +306,41 @@ handlers['GET /api/me'] = async (req, res) => {
   return sendJson(res, 200, { user: sanitizedUser(user) });
 };
 
+/**
+ * 内部会话校验(供前端定时/聚焦轮询):
+ *  - 只回权限位与版本号, 不含任何业务数据(无编号/类型/潜次/深度/坐标/影像/备注,
+ *    甚至不含"是否存在受限数据"这类存在性信息), 因此它不是一次读取, 不写查看/列表审计;
+ *  - 是否审计完全由服务端按端点决定, 客户端没有任何开关;
+ *  - 未登录/已停用一律 401; 除可选 siteId 外忽略所有入参, 不能借它做条件探测。
+ */
+function permissionView(site, user) {
+  const isAdmin = user.role === 'admin';
+  const allowed = isAdmin ? new Set(RESTRICTED_FIELDS) : fieldsFor(user.id, site.id);
+  return {
+    id: site.id,
+    version: site.version,
+    permissions: {
+      coords: isAdmin || allowed.has('coords'),
+      image: isAdmin || allowed.has('image'),
+      note: isAdmin || allowed.has('note'),
+    },
+  };
+}
+
+handlers['POST /api/session/check'] = async (req, res) => {
+  const { user } = getUser(req);
+  if (!user) return sendJson(res, 401, { error: '未登录' });
+  const body = await readBody(req).catch(() => ({}));
+  let rows;
+  if (typeof body.siteId === 'string' && body.siteId) {
+    const one = db.sites.find(s => s.id === body.siteId);
+    rows = one ? [one] : [];
+  } else {
+    rows = db.sites;
+  }
+  return sendJson(res, 200, { user: sanitizedUser(user), sites: rows.map(s => permissionView(s, user)) });
+};
+
 /* -------- 遗址列表 / 详情 / 统计 / 导出: 全部脱敏 -------- */
 
 function filterSites(body, viewer) {
@@ -337,19 +372,17 @@ handlers['POST /api/sites/list'] = async (req, res) => {
   const { user } = getUser(req);
   if (!user) return sendJson(res, 401, { error: '未登录' });
   let body = {};
-  try { body = await readBody(req); } catch (_) { body = {} }
-  const silent = body.silent === true; // 前端定时会话校验不算一次显式查看, 不刷审计
-  delete body.silent;
+  try { body = await readBody(req); } catch (_) { body = {}; }
+  // 注意: 不存在客户端静默开关。伪造的 silent 只是未知字段, 会按受限/未知筛选条件拒绝;
+  // 内部轮询请走 /api/session/check(不返回业务数据, 因此不写查看审计)。
   try {
     const rows = filterSites(body, user);
-    // 列表即查看: 记录操作者/时间/结果, 便于查错
-    if (!silent) {
-      audit({ actorId: user.id, action: 'list', result: 'success',
-        detail: `列表 ${rows.length} 条${Object.keys(body).length ? '（带筛选）' : ''}`, ip: clientIp(req) });
-    }
+    // 列表即查看: 无条件记录操作者/时间/对象/结果, 便于查错
+    audit({ actorId: user.id, action: 'list', target: '遗址列表', result: 'success',
+      detail: `列表 ${rows.length} 条${Object.keys(body).length ? '（带筛选）' : ''}`, ip: clientIp(req) });
     return sendJson(res, 200, { sites: rows.map(s => redactSite(s, user)) });
   } catch (e) {
-    audit({ actorId: user.id, action: 'list', result: 'denied', detail: e.clientMsg || e.message, ip: clientIp(req) });
+    audit({ actorId: user.id, action: 'list', target: '遗址列表', result: 'denied', detail: e.clientMsg || e.message, ip: clientIp(req) });
     return sendJson(res, e.status || 400, { error: e.clientMsg || '筛选条件非法' });
   }
 };
@@ -367,16 +400,13 @@ handlers['GET /api/sites/:id'] = async (req, res, params) => {
       detail: '打开不存在的遗址详情', ip: clientIp(req) });
     return sendJson(res, 404, { error: '遗址不存在' });
   }
-  const silent = new URL(req.url, 'http://x').searchParams.get('silent') === '1';
-  // 详情进入即一次查看: 记录操作者/时间/对象/结果, 与揭示动作保持同一审计口径
-  if (!silent) {
-    const allowed = fieldsFor(user.id, site.id);
-    const grantDesc = user.role === 'admin'
-      ? '管理员全部字段'
-      : `当前可见受限字段: ${[...allowed].join(',') || '无'}`;
-    audit({ actorId: user.id, action: 'view', target: site.code, result: 'success',
-      detail: `进入详情（${grantDesc}）`, ip: clientIp(req) });
-  }
+  // 详情进入即一次查看: 无条件记录, 客户端无法用任何参数关闭审计
+  const allowed = fieldsFor(user.id, site.id);
+  const grantDesc = user.role === 'admin'
+    ? '管理员全部字段'
+    : `当前可见受限字段: ${[...allowed].join(',') || '无'}`;
+  audit({ actorId: user.id, action: 'view', target: site.code, result: 'success',
+    detail: `进入详情（${grantDesc}）`, ip: clientIp(req) });
   return sendJson(res, 200, { site: redactSite(site, user) });
 };
 
@@ -590,11 +620,11 @@ handlers['POST /api/stats'] = async (req, res) => {
       byType[s.type] = (byType[s.type] || 0) + 1;
       byDive[s.dive] = (byDive[s.dive] || 0) + 1;
     }
-    audit({ actorId: user.id, action: 'stats', result: 'success',
+    audit({ actorId: user.id, action: 'stats', target: '统计', result: 'success',
       detail: `${rows.length} 条记录的公共字段统计`, ip: clientIp(req) });
     return sendJson(res, 200, { total: rows.length, byType, byDive });
   } catch (e) {
-    audit({ actorId: user.id, action: 'stats', result: 'denied', detail: e.clientMsg || e.message, ip: clientIp(req) });
+    audit({ actorId: user.id, action: 'stats', target: '统计', result: 'denied', detail: e.clientMsg || e.message, ip: clientIp(req) });
     return sendJson(res, 400, { error: e.clientMsg || '筛选条件非法' });
   }
 };
@@ -602,7 +632,7 @@ handlers['POST /api/stats'] = async (req, res) => {
 handlers['POST /api/export'] = async (req, res) => {
   const { user } = getUser(req);
   if (!user) {
-    audit({ actorId: null, action: 'export', result: 'denied', detail: '未登录导出', ip: clientIp(req) });
+    audit({ actorId: null, action: 'export', target: '导出', result: 'denied', detail: '未登录导出', ip: clientIp(req) });
     return sendJson(res, 401, { error: '未登录' });
   }
   let body = {};
@@ -611,7 +641,7 @@ handlers['POST /api/export'] = async (req, res) => {
   try {
     rows = filterSites(body, user);
   } catch (e) {
-    audit({ actorId: user.id, action: 'export', result: 'denied', detail: e.clientMsg || e.message, ip: clientIp(req) });
+    audit({ actorId: user.id, action: 'export', target: '导出', result: 'denied', detail: e.clientMsg || e.message, ip: clientIp(req) });
     return sendJson(res, 400, { error: e.clientMsg || '筛选条件非法' });
   }
   // 导出是唯一允许把受限明文随数据带走的通道, 逐字段按授权附带

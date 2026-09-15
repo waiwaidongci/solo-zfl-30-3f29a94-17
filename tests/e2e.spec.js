@@ -628,6 +628,175 @@ test('越权揭示与无权隐藏均失败, 原值与版本保持不变', async 
   expect(after.coords).toMatchObject({ obscured: true });
 });
 
+/* ------------- 8f. 回归: 伪造静默标记不能绕过读取审计 --------------- */
+
+async function auditRows(context, extra = {}) {
+  const r = await context.request.fetch(BASE + '/api/admin/audit', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    data: JSON.stringify({ limit: 500, ...extra }),
+  });
+  expect(r.status()).toBe(200);
+  return (await r.json()).audit;
+}
+
+test('伪造 silent 标记: 详情照样返回数据并记录查看; 列表无法借未知字段静默读取', async ({ browser }) => {
+  const { context } = await newLoggedInContext(browser, 'lin', 'lin123');
+  const adminCtx = await browser.newContext();
+  const ap = await adminCtx.newPage();
+  await loginViaUi(ap, 'admin', 'admin123');
+
+  const countLinViews = async () => (await auditRows(adminCtx, { action: 'view' }))
+    .filter(r => r.actorId === 'u-lin' && r.target === 'S-001' && r.result === 'success'
+      && r.detail.includes('进入详情')).length;
+
+  const before = await countLinViews();
+  // 在详情 URL 上伪造 ?silent=1: 标记被服务端忽略, 仍返回真实数据且写一条成功查看审计
+  const r = await context.request.fetch(BASE + '/api/sites/s-001?silent=1');
+  expect(r.status()).toBe(200);
+  const j = await r.json();
+  expect(j.site.code).toBe('S-001');
+  expect(j.site.permissions.note).toBe(true);
+  const after = await countLinViews();
+  expect(after).toBe(before + 1);
+
+  // 列表通道伪造 silent: 白名单直接拒绝(400), 且记一条拒绝审计 —— 不存在"200 但不审计"的可能
+  const denied = await context.request.fetch(BASE + '/api/sites/list', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, data: JSON.stringify({ silent: true }),
+  });
+  expect(denied.status()).toBe(400);
+  const deniedRows = (await auditRows(adminCtx, { action: 'list', result: 'denied' }))
+    .filter(x => x.actorId === 'u-lin');
+  expect(deniedRows.length).toBeGreaterThanOrEqual(1);
+
+  // 正常列表读取照常记成功
+  const okBefore = (await auditRows(adminCtx, { action: 'list', result: 'success' }))
+    .filter(x => x.actorId === 'u-lin').length;
+  const ok = await context.request.fetch(BASE + '/api/sites/list', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, data: JSON.stringify({}),
+  });
+  expect(ok.status()).toBe(200);
+  const okAfter = (await auditRows(adminCtx, { action: 'list', result: 'success' }))
+    .filter(x => x.actorId === 'u-lin').length;
+  expect(okAfter).toBe(okBefore + 1);
+
+  await adminCtx.close(); await context.close();
+});
+
+/* ---------- 8g. 回归: 内部会话校验只回权限位, 无业务数据/无审计 ---------- */
+
+test('/api/session/check 最小化返回且不写查看审计; 未登录 401; siteId 只精确匹配', async ({ browser, context: anonCtx }) => {
+  // 未登录 401
+  const noAuth = await anonCtx.request.fetch(BASE + '/api/session/check', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, data: JSON.stringify({}),
+  });
+  expect(noAuth.status()).toBe(401);
+
+  const { context } = await newLoggedInContext(browser, 'lin', 'lin123');
+  const adminCtx = await browser.newContext();
+  const ap = await adminCtx.newPage();
+  await loginViaUi(ap, 'admin', 'admin123');
+
+  const counts = async () => {
+    const rows = await auditRows(adminCtx);
+    return {
+      n: rows.length,
+      list: rows.filter(r => r.actorId === 'u-lin' && r.action === 'list').length,
+      view: rows.filter(r => r.actorId === 'u-lin' && r.action === 'view').length,
+    };
+  };
+  const before = await counts();
+
+  const r = await context.request.fetch(BASE + '/api/session/check', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, data: JSON.stringify({}),
+  });
+  expect(r.status()).toBe(200);
+  const raw = await r.text();
+  const j = JSON.parse(raw);
+  expect(j.user.id).toBe('u-lin');
+  expect(j.sites).toHaveLength(3);
+  for (const v of j.sites) {
+    // 每条只有 id/version/permissions 三个键
+    expect(Object.keys(v).sort()).toEqual(['id', 'permissions', 'version']);
+    expect(Object.keys(v.permissions).sort()).toEqual(['coords', 'image', 'note']);
+  }
+  const s1 = j.sites.find(s => s.id === 's-001');
+  expect(s1.permissions).toEqual({ coords: true, image: true, note: true });
+  const s2 = j.sites.find(s => s.id === 's-002');
+  expect(s2.permissions).toEqual({ coords: false, image: false, note: false });
+  // 响应字节里不含任何业务明文/公共字段值/受限数据
+  expect(raw).not.toContain('靠近船肋');
+  expect(raw).not.toContain('采样需审批');
+  expect(raw).not.toContain('data:image');
+  expect(raw).not.toContain('DIVE-');
+  expect(raw).not.toContain('17.8m');
+  expect(raw).not.toContain('"coords":{');
+  expect(raw).not.toContain('"code"');
+
+  // 连续多次内部校验不产生任何 list/view 审计(总条数也不增长)
+  for (let i = 0; i < 3; i++) {
+    await context.request.fetch(BASE + '/api/session/check', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      data: JSON.stringify({ siteId: 's-001' }),
+    });
+  }
+  const after = await counts();
+  expect(after.n).toBe(before.n);
+  expect(after.list).toBe(before.list);
+  expect(after.view).toBe(before.view);
+
+  // siteId 精确匹配: 只回一条; 额外/伪造参数被忽略, 不能借它做条件探测
+  const one = await (await context.request.fetch(BASE + '/api/session/check', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    data: JSON.stringify({ siteId: 's-002', note: '靠近船肋', code: 'S-001' }),
+  })).json();
+  expect(one.sites).toHaveLength(1);
+  expect(one.sites[0].id).toBe('s-002');
+
+  const none = await (await context.request.fetch(BASE + '/api/session/check', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    data: JSON.stringify({ siteId: 'not-exist' }),
+  })).json();
+  expect(none.sites).toEqual([]);
+
+  await adminCtx.close(); await context.close();
+});
+
+/* ---------- 8h. 回归: 完整审计链路(操作者/时间/对象/结果) ---------- */
+
+test('列表/详情/揭示/隐藏/导出审计链完整且字段齐全', async ({ browser }) => {
+  const { context } = await newLoggedInContext(browser, 'lin', 'lin123');
+  const doJson = async (method, url, body) => {
+    const opt = { method, headers: {} };
+    if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.data = JSON.stringify(body); }
+    return context.request.fetch(BASE + url, opt);
+  };
+  await doJson('POST', '/api/sites/list', { type: 'wreck' });
+  await doJson('GET', '/api/sites/s-001');
+  await doJson('POST', '/api/sites/s-001/reveal', { field: 'note' });
+  await doJson('POST', '/api/sites/s-001/hide', { fields: ['note'] });
+  await doJson('POST', '/api/export', {});
+
+  const adminCtx = await browser.newContext();
+  const ap = await adminCtx.newPage();
+  await loginViaUi(ap, 'admin', 'admin123');
+  const rows = await auditRows(adminCtx, { limit: 500 });
+  const lin = rows.filter(r => r.actorId === 'u-lin');
+  const expectOne = (action, result, part) => {
+    const hit = lin.filter(r => r.action === action && r.result === result && (!part || r.detail.includes(part)));
+    expect(hit.length, `${action}/${result}/${part}`).toBeGreaterThanOrEqual(1);
+    const r = hit[0];
+    expect(r.at).toMatch(/^\d{4}-\d{2}-\d{2}T/); // 时间
+    expect(r.target).toBeTruthy();
+    expect(r.actorName).toBe('lin');
+  };
+  expectOne('list', 'success');
+  expectOne('view', 'success', '进入详情');
+  expectOne('view', 'success', '揭示字段');
+  expectOne('hide', 'success', '隐藏字段');
+  expectOne('export', 'success');
+  await adminCtx.close(); await context.close();
+});
+
 /* ---------------- 9. 手机端: 授权/查看/导出/撤销/查错全流程 ----------- */
 
 test('手机视口下可完成授权、查看、导出、撤销、查错', async ({ browser }) => {
